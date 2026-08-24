@@ -1,37 +1,31 @@
 import React, { useRef, useState, useEffect, useCallback } from "react";
+import { BALL_MATERIALS, GROUND_MATERIALS } from "./materials";
+import { stepBall } from "./physicsSolver";
 
-// ---- Physics constants ----
-const G = 9.8; // m/s^2, real gravity
-const PIXELS_PER_METER = 100; // world scale
-const BALL_RADIUS_M = 0.15; // 15 cm ball
+// ---- World constants (not material-specific) ----
+const G = 9.8; // m/s^2
+const PIXELS_PER_METER = 100;
+const BALL_RADIUS_M = 0.15;
 const GROUND_HEIGHT_PX = 60;
 
 export default function GravitySim() {
   const containerRef = useRef(null);
   const rafRef = useRef(null);
   const lastTimeRef = useRef(null);
+  const dragRef = useRef(null); // { startX, startY, startT } while mouse is down
 
   const [dims, setDims] = useState({ width: 800, height: 600 });
+  const [ballMatKey, setBallMatKey] = useState("rubber");
+  const [groundMatKey, setGroundMatKey] = useState("concrete");
 
-  // Ball state lives in refs for the physics loop (avoids stale closures / re-render churn),
-  // mirrored into React state only for rendering.
-  const physicsRef = useRef({
-    active: false,
-    y: 0, // px, distance fallen from release point (0 = at release station)
-    v: 0, // m/s, downward velocity
-    releaseY: 0, // px, y-coordinate of release point (top of ball at release)
-    x: 0, // px, x-coordinate (fixed once released)
-  });
-
-  const [render, setRender] = useState({ active: false, x: 0, y: 0 });
-  const [stationX, setStationX] = useState(null);
-  const [elapsed, setElapsed] = useState(0);
-  const [impactSpeed, setImpactSpeed] = useState(null);
+  const physicsRef = useRef({ active: false, xM: 0, yM: 0, vxM: 0, vyM: 0 });
+  const [render, setRender] = useState({ active: false, xPx: 0, yPx: 0 });
+  const [readout, setReadout] = useState({ speed: 0, inContact: false, bounces: 0, status: "Ready" });
 
   const ballRadiusPx = BALL_RADIUS_M * PIXELS_PER_METER;
-  const groundY = dims.height - GROUND_HEIGHT_PX;
+  const groundYPx = dims.height - GROUND_HEIGHT_PX;
+  const groundYM = groundYPx / PIXELS_PER_METER;
 
-  // Track container size
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
@@ -53,6 +47,9 @@ export default function GravitySim() {
     lastTimeRef.current = null;
   }, []);
 
+  const wasInContactRef = useRef(false);
+  const bounceCountRef = useRef(0);
+
   const step = useCallback(
     (timestamp) => {
       const p = physicsRef.current;
@@ -64,120 +61,196 @@ export default function GravitySim() {
         return;
       }
 
-      let dt = (timestamp - lastTimeRef.current) / 1000; // seconds
-      // clamp dt to avoid huge jumps if tab was backgrounded
-      dt = Math.min(dt, 1 / 30);
+      let dt = (timestamp - lastTimeRef.current) / 1000;
+      dt = Math.min(dt, 1 / 30); // clamp so a backgrounded tab doesn't cause a huge jump
       lastTimeRef.current = timestamp;
 
-      // v = v0 + g*dt ; y = y0 + v*dt  (semi-implicit Euler — stable for this)
-      p.v = p.v + G * dt;
-      p.y = p.y + p.v * dt * PIXELS_PER_METER;
+      const ballMaterial = BALL_MATERIALS[ballMatKey];
+      const groundMaterial = GROUND_MATERIALS[groundMatKey];
 
-      const ballCenterY = p.releaseY + p.y + ballRadiusPx;
-      const maxCenterY = groundY - ballRadiusPx;
+      const { state, contact } = stepBall(
+        { xM: p.xM, yM: p.yM, vxM: p.vxM, vyM: p.vyM },
+        {
+          dt,
+          gravity: G,
+          groundYM,
+          ballRadiusM: BALL_RADIUS_M,
+          mass: ballMaterial.massKg,
+          ballMaterial,
+          groundMaterial,
+        }
+      );
 
-      if (ballCenterY >= maxCenterY) {
-        // Landed: clamp to ground, stop dead (no bounce)
-        p.y = maxCenterY - p.releaseY - ballRadiusPx;
-        setImpactSpeed(p.v);
+      p.xM = state.xM;
+      p.yM = state.yM;
+      p.vxM = state.vxM;
+      p.vyM = state.vyM;
+
+      // count a "bounce" each time the ball transitions into contact
+      if (contact.inContact && !wasInContactRef.current) {
+        bounceCountRef.current += 1;
+      }
+      wasInContactRef.current = contact.inContact;
+
+      const xPx = state.xM * PIXELS_PER_METER;
+      const yPx = state.yM * PIXELS_PER_METER;
+      const speed = Math.hypot(state.vxM, state.vyM);
+
+      setRender({ active: true, xPx, yPx });
+      setReadout({
+        speed,
+        inContact: contact.inContact,
+        bounces: bounceCountRef.current,
+        status: contact.inContact ? "In contact" : "Falling / airborne",
+      });
+
+      // stop condition: ball has settled (low speed) while resting on the ground
+      const settled = contact.inContact && speed < 0.03;
+      const offscreen = xPx < -ballRadiusPx * 2 || xPx > dims.width + ballRadiusPx * 2;
+
+      if (settled || offscreen) {
         p.active = false;
-        setRender({ active: false, x: p.x, y: maxCenterY - ballRadiusPx });
-        setElapsed((t) => t); // freeze
+        setReadout((r) => ({ ...r, status: settled ? "Settled" : "Left the stage" }));
         stopLoop();
         return;
       }
 
-      setRender({ active: true, x: p.x, y: ballCenterY - ballRadiusPx });
       rafRef.current = requestAnimationFrame(step);
     },
-    [ballRadiusPx, groundY, stopLoop]
+    [ballMatKey, groundMatKey, groundYM, dims.width, ballRadiusPx, stopLoop]
   );
 
-  const releaseBall = useCallback(
-    (clickX) => {
+  const launchBall = useCallback(
+    (startXPx, startYPx, vxMps, vyMps) => {
       stopLoop();
-      const releaseTopY = 40; // px from top, just below the release station bar
+      bounceCountRef.current = 0;
+      wasInContactRef.current = false;
       physicsRef.current = {
         active: true,
-        y: 0,
-        v: 0,
-        releaseY: releaseTopY,
-        x: clickX,
+        xM: startXPx / PIXELS_PER_METER,
+        yM: startYPx / PIXELS_PER_METER,
+        vxM: vxMps,
+        vyM: vyMps,
       };
-      setStationX(clickX);
-      setImpactSpeed(null);
-      setElapsed(0);
-      setRender({ active: true, x: clickX, y: releaseTopY });
+      setRender({ active: true, xPx: startXPx, yPx: startYPx });
+      setReadout({ speed: Math.hypot(vxMps, vyMps), inContact: false, bounces: 0, status: "Falling / airborne" });
       rafRef.current = requestAnimationFrame(step);
     },
     [step, stopLoop]
   );
 
-  const handleClick = (e) => {
+  const getLocalPos = (e) => {
     const rect = containerRef.current.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    releaseBall(x);
+    return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+  };
+
+  const handleMouseDown = (e) => {
+    const { x, y } = getLocalPos(e);
+    dragRef.current = { startX: x, startY: y, startT: performance.now() };
+  };
+
+  const handleMouseUp = (e) => {
+    if (!dragRef.current) return;
+    const { x, y } = getLocalPos(e);
+    const { startX, startY, startT } = dragRef.current;
+    dragRef.current = null;
+
+    const dtDrag = Math.max((performance.now() - startT) / 1000, 1 / 60);
+    const dragXPx = x - startX;
+    const dragYPx = y - startY;
+
+    // A quick click (near-zero drag) behaves like the original sim: a plain drop.
+    // A drag imparts velocity opposite the drag direction (pull back, release
+    // forward — slingshot-style), capped so throws stay readable on screen.
+    const dragDistPx = Math.hypot(dragXPx, dragYPx);
+    let vx = 0;
+    let vy = 0;
+    if (dragDistPx > 8) {
+      const rawVx = (-dragXPx / dtDrag) / PIXELS_PER_METER;
+      const rawVy = (-dragYPx / dtDrag) / PIXELS_PER_METER;
+      const maxSpeed = 8; // m/s, keeps throws from launching off-scale
+      const rawSpeed = Math.hypot(rawVx, rawVy);
+      const scale = rawSpeed > maxSpeed ? maxSpeed / rawSpeed : 1;
+      vx = rawVx * scale;
+      vy = rawVy * scale;
+    }
+
+    launchBall(startX, startY, vx, vy);
   };
 
   useEffect(() => stopLoop, [stopLoop]);
 
-  const ballTop = render.y;
-  const ballLeft = render.x - ballRadiusPx;
+  const ballTopPx = render.yPx - ballRadiusPx;
+  const ballLeftPx = render.xPx - ballRadiusPx;
 
   return (
     <div style={styles.page}>
       <div style={styles.header}>
-        <h1 style={styles.title}>Gravity Simulation</h1>
+        <h1 style={styles.title}>Gravity + Contact Sim</h1>
         <p style={styles.subtitle}>
-          g = {G} m/s² &nbsp;•&nbsp; click anywhere to release the ball
+          click to drop &nbsp;•&nbsp; click-drag to throw &nbsp;•&nbsp; g = {G} m/s²
         </p>
+      </div>
+
+      <div style={styles.controls}>
+        <label style={styles.controlLabel}>
+          Ball
+          <select
+            style={styles.select}
+            value={ballMatKey}
+            onChange={(e) => setBallMatKey(e.target.value)}
+          >
+            {Object.entries(BALL_MATERIALS).map(([key, m]) => (
+              <option key={key} value={key}>{m.name}</option>
+            ))}
+          </select>
+        </label>
+        <label style={styles.controlLabel}>
+          Ground
+          <select
+            style={styles.select}
+            value={groundMatKey}
+            onChange={(e) => setGroundMatKey(e.target.value)}
+          >
+            {Object.entries(GROUND_MATERIALS).map(([key, m]) => (
+              <option key={key} value={key}>{m.name}</option>
+            ))}
+          </select>
+        </label>
       </div>
 
       <div
         ref={containerRef}
-        onClick={handleClick}
+        onMouseDown={handleMouseDown}
+        onMouseUp={handleMouseUp}
         style={styles.stage}
       >
-        {/* Release station rail */}
-        <div style={styles.rail} />
-
-        {/* Release marker at chosen x */}
-        {stationX !== null && (
-          <div
-            style={{
-              ...styles.releaseMarker,
-              left: stationX - 10,
-            }}
-          />
-        )}
-
-        {/* Ball */}
-        {stationX !== null && (
+        {render.active || readout.status !== "Ready" ? (
           <div
             style={{
               ...styles.ball,
               width: ballRadiusPx * 2,
               height: ballRadiusPx * 2,
-              left: ballLeft,
-              top: ballTop,
+              left: ballLeftPx,
+              top: ballTopPx,
+              boxShadow: readout.inContact
+                ? "0 0 18px rgba(56,189,248,0.9)"
+                : "0 0 12px rgba(56,189,248,0.5)",
             }}
           />
-        )}
+        ) : null}
 
-        {/* Ground */}
         <div style={{ ...styles.ground, height: GROUND_HEIGHT_PX }} />
 
-        {!stationX && (
-          <div style={styles.hint}>Click anywhere to drop the ball</div>
+        {readout.status === "Ready" && (
+          <div style={styles.hint}>Click to drop • click and drag to throw</div>
         )}
       </div>
 
-      <div style={styles.readout}>
-        {impactSpeed !== null
-          ? `Impact speed: ${impactSpeed.toFixed(2)} m/s`
-          : render.active
-          ? "Falling…"
-          : "Ready"}
+      <div style={styles.readoutRow}>
+        <span>{readout.status}</span>
+        <span>speed: {readout.speed.toFixed(2)} m/s</span>
+        <span>bounces: {readout.bounces}</span>
       </div>
     </div>
   );
@@ -191,25 +264,29 @@ const styles = {
     width: "100%",
     background: "#0f1115",
     color: "#e8e8e8",
-    fontFamily:
-      "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
+    fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
     boxSizing: "border-box",
     padding: 16,
-    gap: 12,
+    gap: 10,
   },
-  header: {
-    textAlign: "center",
-  },
-  title: {
-    margin: 0,
-    fontSize: 20,
-    fontWeight: 600,
-    letterSpacing: 0.2,
-  },
-  subtitle: {
-    margin: "4px 0 0",
+  header: { textAlign: "center" },
+  title: { margin: 0, fontSize: 20, fontWeight: 600, letterSpacing: 0.2 },
+  subtitle: { margin: "4px 0 0", fontSize: 13, color: "#8a8f98" },
+  controls: {
+    display: "flex",
+    gap: 16,
+    justifyContent: "center",
     fontSize: 13,
-    color: "#8a8f98",
+    color: "#c7ccd6",
+  },
+  controlLabel: { display: "flex", alignItems: "center", gap: 6 },
+  select: {
+    background: "#1a1d24",
+    color: "#e8e8e8",
+    border: "1px solid #3a3f4b",
+    borderRadius: 6,
+    padding: "4px 8px",
+    fontSize: 13,
   },
   stage: {
     position: "relative",
@@ -219,29 +296,12 @@ const styles = {
     overflow: "hidden",
     cursor: "crosshair",
     border: "1px solid #262a33",
-  },
-  rail: {
-    position: "absolute",
-    top: 36,
-    left: 0,
-    right: 0,
-    height: 4,
-    background: "#3a3f4b",
-  },
-  releaseMarker: {
-    position: "absolute",
-    top: 26,
-    width: 20,
-    height: 20,
-    borderRadius: "50%",
-    border: "2px solid #f5a623",
-    boxSizing: "border-box",
+    userSelect: "none",
   },
   ball: {
     position: "absolute",
     borderRadius: "50%",
     background: "radial-gradient(circle at 35% 30%, #7dd3fc, #0284c7 70%)",
-    boxShadow: "0 0 12px rgba(56,189,248,0.5)",
   },
   ground: {
     position: "absolute",
@@ -259,8 +319,10 @@ const styles = {
     color: "#5a5f6a",
     fontSize: 14,
   },
-  readout: {
-    textAlign: "center",
+  readoutRow: {
+    display: "flex",
+    justifyContent: "center",
+    gap: 24,
     fontSize: 13,
     color: "#8a8f98",
     fontVariantNumeric: "tabular-nums",
