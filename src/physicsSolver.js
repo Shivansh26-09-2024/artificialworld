@@ -2,9 +2,9 @@
 //
 // The "numerical solver" layer. This is the only file that knows
 // how to advance time. It pulls effective parameters from
-// materials.js, pulls forces from contactModel.js, sums them with
-// gravity, and integrates F=ma forward with semi-implicit
-// (symplectic) Euler — same scheme the original drop-only sim used.
+// materials.js, pulls forces from contactModel.js and (for hollow
+// balls) gasModel.js, sums them with gravity, and integrates F=ma
+// forward with semi-implicit (symplectic) Euler.
 //
 // All quantities in/out of stepBall are SI: meters, m/s, seconds,
 // downward = positive y. Pixel conversion belongs in the component,
@@ -12,15 +12,14 @@
 //
 // Why substeps: a stiff contact spring (large k) has a short natural
 // oscillation period. If the simulation timestep is larger than
-// that period, explicit Euler-family integrators blow up — this is
-// exactly the "your timestep might be too large" failure mode the
-// doc calls out. Rather than picking a fixed substep count and
-// hoping, this solver estimates the spring's natural frequency each
-// call and picks enough substeps to stay safely inside the stable
-// range.
+// that period, explicit Euler-family integrators blow up. Rather
+// than picking a fixed substep count and hoping, this solver
+// estimates the spring's natural frequency each call and picks
+// enough substeps to stay safely inside the stable range.
 
 import { effectiveContactStiffness, effectiveContactDamping, effectiveFriction } from "./materials";
 import { normalContactForce, frictionForce } from "./contactModel";
+import { currentInternalVolume, gasPressure, gasOverpressureForce } from "./gasModel";
 
 const STABILITY_SAFETY_FACTOR = 6; // higher = more conservative (more substeps)
 
@@ -41,6 +40,13 @@ export function stepBall(state, params) {
   const c = effectiveContactDamping(ballMaterial, groundMaterial, ballRadiusM);
   const mu = effectiveFriction(ballMaterial, groundMaterial);
 
+  // Gas layer setup (section 11-12): only applies to hollow balls.
+  // Computed once per step (not per substep) since it only needs the
+  // material flag + initial pressure, both constant for this call.
+  const isHollow = !!ballMaterial.hollow;
+  const initialVolumeM3 = isHollow ? currentInternalVolume({ ballRadiusM, penetrationM: 0 }) : 0;
+  const initialPressurePa = isHollow ? ballMaterial.gasInitialPressurePa : 0;
+
   const substeps = stableSubstepCount(dt, k, mass, minSubsteps);
   const h = dt / substeps;
 
@@ -49,7 +55,14 @@ export function stepBall(state, params) {
   let vx = state.vxM;
   let vy = state.vyM;
 
-  let lastContact = { inContact: false, penetrationM: 0, normalForceN: 0, frictionForceN: 0 };
+  let lastContact = {
+    inContact: false,
+    penetrationM: 0,
+    normalForceN: 0,
+    frictionForceN: 0,
+    gasPressurePa: isHollow ? initialPressurePa : null,
+    gasForceN: 0,
+  };
 
   for (let i = 0; i < substeps; i++) {
     const penetration = y + ballRadiusM - groundYM; // > 0 means overlapping the ground
@@ -57,6 +70,8 @@ export function stepBall(state, params) {
 
     let normalF = 0;
     let frictionF = 0;
+    let gasP = isHollow ? initialPressurePa : null;
+    let gasF = 0;
     let fy = mass * gravity; // gravity, downward positive
     let fx = 0;
 
@@ -67,10 +82,22 @@ export function stepBall(state, params) {
         stiffness: k,
         damping: c,
       });
-      fy -= normalF; // contact pushes back up, against gravity/downward motion
+
+      if (isHollow) {
+        const currentVolumeM3 = currentInternalVolume({ ballRadiusM, penetrationM: penetration });
+        gasP = gasPressure({
+          initialPressurePa,
+          initialVolumeM3,
+          currentVolumeM3,
+        });
+        const contactAreaM2 = Math.PI * ballRadiusM * ballRadiusM; // same area convention as materials.js stiffness calc
+        gasF = gasOverpressureForce({ internalPressurePa: gasP, contactAreaM2 });
+      }
+
+      fy -= normalF + gasF; // contact spring AND gas overpressure both push back up
 
       frictionF = frictionForce({
-        normalForce: normalF,
+        normalForce: normalF + gasF, // gas overpressure increases the normal load, so it increases available friction too
         tangentialVelocity: vx,
         frictionCoeff: mu,
         mass,
@@ -89,6 +116,8 @@ export function stepBall(state, params) {
       penetrationM: Math.max(penetration, 0),
       normalForceN: normalF,
       frictionForceN: frictionF,
+      gasPressurePa: gasP,
+      gasForceN: gasF,
     };
   }
 

@@ -1,10 +1,11 @@
 // materials.js
 //
-// This file is the "material library" layer described in the doc:
-// it holds ONLY properties + parameters (density, stiffness-related
-// modulus, damping, friction). It contains NO physics equations —
-// those live in contactModel.js. This file just answers
-// "what are the numbers for this material", not "what do they do".
+// The "material library" layer described in the doc: it holds ONLY
+// properties + parameters (density, stiffness-related modulus,
+// damping, friction, and now gas state for hollow balls). It
+// contains NO physics equations — those live in contactModel.js
+// and gasModel.js. This file just answers "what are the numbers
+// for this material", not "what do they do".
 //
 // Units are SI (meters, kilograms, seconds, Pascals) EXCEPT where
 // noted. Real rubber has E on the order of 1e7-1e8 Pa; that value
@@ -18,10 +19,15 @@ export const BALL_MATERIALS = {
   rubber: {
     name: "Rubber (tennis-ball-like)",
     massKg: 0.058, // real tennis ball mass, set directly (hollow shell, so density*volume would overestimate)
-    density: 1100, // kg/m^3 — kept for reference / future use (e.g. a gas layer), not used in the contact force calc below
+    density: 1100, // kg/m^3 — kept for reference / future use, not used in the contact force calc below
     youngsModulus: 5e4, // Pa (scaled, see file note)
     dampingCoeff: 400, // Pa*s — Kelvin-Voigt "eta", controls energy loss on impact
     frictionCoeff: 0.8,
+    // Gas layer (section 11-12 of the doc): this ball is hollow and
+    // pressurized. gasInitialPressurePa is set above ambient, like a
+    // real tennis ball (~1 atm overpressure when new).
+    hollow: true,
+    gasInitialPressurePa: 101325 + 60000, // ~1.6 atm absolute, roughly tennis-ball-like
   },
   superball: {
     name: "Superball (high-restitution rubber)",
@@ -30,6 +36,7 @@ export const BALL_MATERIALS = {
     youngsModulus: 9e4,
     dampingCoeff: 60, // much lower damping -> bounces back higher, closer to elastic
     frictionCoeff: 0.85,
+    hollow: false, // solid rubber — no internal gas contribution
   },
   steel: {
     name: "Steel ball bearing",
@@ -38,6 +45,7 @@ export const BALL_MATERIALS = {
     youngsModulus: 2.1e6, // much stiffer than rubber -> short, sharp, low bounce
     dampingCoeff: 30,
     frictionCoeff: 0.4,
+    hollow: false,
   },
 };
 
